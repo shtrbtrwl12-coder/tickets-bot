@@ -36,15 +36,49 @@ const client = new Client({
 const CATEGORY_ID = '1535774150277337118';
 const SUPPORT_ROLE_ID = '1535774790357614652';
 const BANNER_IMAGE_URL = 'https://cdn.discordapp.com/attachments/1531644529818472458/1535769197286793226/2F8C5A40-B030-4AAE-A84C-975BDB26B9CC.png?ex=6a78f805&is=6a77a685&hm=f64c0b9b99314f73927eb468b1b2ded1b15be82de1a30b069aae62308c2213ce&';
+const TARGET_CHANNEL_ID = '1535496283115225208';
 
 // لتتبع فترات الانتظار الخاصة بأمر "استدعاء" (كل 15 ثانية لكل مستخدم)
 const summonCooldowns = new Map();
 
 client.once('ready', async () => {
   console.log(`Tickets Bot logged in as ${client.user.tag}!`);
+
+  // إرسال قائمة التذاكر تلقائياً في الروم المحدد عند اشتغال البوت
+  try {
+    const channel = await client.channels.fetch(TARGET_CHANNEL_ID);
+    if (channel && channel.isTextBased()) {
+      const selectMenu = new StringSelectMenuBuilder()
+        .setCustomId('ticket_select_menu')
+        .setPlaceholder('يرجى اختيار نوع التذكرة')
+        .addOptions([
+          { label: 'التواصل مع الإدارة', value: 'ticket_management', description: 'التواصل المباشر مع إدارة السيرفر' },
+          { label: 'الشكاوي', value: 'ticket_complaints', description: 'تقديم شكوى رسمية' },
+          { label: 'طلب رول', value: 'ticket_roles', description: 'طلب الحصول على رولات معينة' },
+          { label: 'اخرى', value: 'ticket_other', description: 'استفسارات أخرى عامة' }
+        ]);
+
+      const row = new ActionRowBuilder().addComponents(selectMenu);
+      
+      const embed = new EmbedBuilder()
+        .setImage(BANNER_IMAGE_URL)
+        .setColor('#2b2d31');
+
+      // التحقق من عدم تكرار إرسال الرسالة إذا كانت موجودة مسبقاً لتجنب سبام الرسائل عند إعادة تشغيل البوت
+      const messages = await channel.messages.fetch({ limit: 5 });
+      const botMessageExists = messages.some(msg => msg.author.id === client.user.id && msg.components.length > 0);
+
+      if (!botMessageExists) {
+        await channel.send({ embeds: [embed], components: [row] });
+        console.log('تم إرسال رسالة التذاكر بنجاح في الروم المحدد!');
+      }
+    }
+  } catch (error) {
+    console.error('خطأ أثناء محاولة إرسال رسالة التذاكر التلقائية:', error);
+  }
 });
 
-// أمر إرسال القائمة المنسدلة لاختيار نوع التذكرة
+// أمر إرسال القائمة المنسدلة يدويًا عبر كتابة setup_ticket
 client.on('messageCreate', async message => {
   if (message.author.bot) return;
 
@@ -183,12 +217,9 @@ client.on('interactionCreate', async interaction => {
       }
 
       try {
-        // إخفاء التكت عن باقي أعضاء الدعم عبر تعديل الصلاحيات وإبقائها لمن قام بالأستلام ورول الإدارة العالية (مثال رول الستريتر أو الأدمن)
-        // يمكننا تحديث الصلاحيات للروم بحيث يختفي عن رول السبورت العادي عدا الشخص المستلم
         await channel.permissionOverwrites.edit(SUPPORT_ROLE_ID, { ViewChannel: false });
         await channel.permissionOverwrites.edit(member.id, { ViewChannel: true, SendMessages: true });
 
-        // إضافة زر "فتح" بجانب أزرار التحكم
         const updatedRow = new ActionRowBuilder().addComponents(
           new ButtonBuilder().setCustomId('ticket_close').setLabel('اغلاق').setStyle(ButtonStyle.Danger).setEmoji('🔒'),
           new ButtonBuilder().setCustomId('ticket_open').setLabel('فتح').setStyle(ButtonStyle.Success).setEmoji('🔓')
@@ -196,7 +227,6 @@ client.on('interactionCreate', async interaction => {
 
         await interaction.message.edit({ components: [updatedRow] }).catch(() => {});
         
-        // رسالة خاصة تظهر للإداري فقط (أو يتم منشنته بشكل مخفي)
         await interaction.reply({ content: `تم استلام التكت بواسطة <@${member.id}>.`, ephemeral: true });
         await channel.send({ content: `تم استلام التذكرة من قبل الإداري <@${member.id}>.` });
       } catch (e) {
@@ -214,7 +244,6 @@ client.on('interactionCreate', async interaction => {
       }
 
       try {
-        // إعادة إظهار الروم لرول الدعم
         await channel.permissionOverwrites.edit(SUPPORT_ROLE_ID, { ViewChannel: true });
 
         const normalRow = new ActionRowBuilder().addComponents(
