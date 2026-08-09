@@ -19,7 +19,10 @@ const {
   ButtonStyle,
   EmbedBuilder,
   PermissionsBitField,
-  StringSelectMenuBuilder
+  StringSelectMenuBuilder,
+  ModalBuilder,
+  TextInputBuilder,
+  TextInputStyle
 } = require('discord.js');
 
 const client = new Client({
@@ -39,7 +42,6 @@ const ADMIN_ROLE_ID = '1535375782736560128';
 const BANNER_IMAGE_URL = 'https://cdn.discordapp.com/attachments/1531644529818472458/1535769197286793226/2F8C5A40-B030-4AAE-A84C-975BDB26B9CC.png?ex=6a78f805&is=6a77a685&hm=f64c0b9b99314f73927eb468b1b2ded1b15be82de1a30b069aae62308c2213ce&';
 const TARGET_CHANNEL_ID = '1535496283115225208';
 
-// لتتبع فترات الانتظار الخاصة بأمر "استدعاء" (كل 15 ثانية لكل مستخدم)
 const summonCooldowns = new Map();
 
 client.once('ready', async () => {
@@ -77,13 +79,11 @@ client.once('ready', async () => {
   }
 });
 
-// أمر إرسال القائمة المنسدلة يدويًا عبر كتابة setup_ticket
 client.on('messageCreate', async message => {
   if (message.author.bot) return;
 
   const contentLower = message.content.toLowerCase().trim();
 
-  // إذا كتب أحد كلمة delete داخل التذكرة لمسحها نهائياً
   if (contentLower === 'delete') {
     if (!message.member.roles.cache.has(ADMIN_ROLE_ID) && !message.member.permissions.has(PermissionsBitField.Flags.Administrator)) return;
     try {
@@ -92,28 +92,35 @@ client.on('messageCreate', async message => {
     return;
   }
 
-  // إذا كتب أحد كلمة إغلاق
+  // منع صاحب التذكرة من كتابة أو تنفيذ إغلاق إذا كان هو صاحب التذكرة، إلا السبورت أو الإدارة
   if (contentLower === 'إغلاق' || contentLower === 'اغلاق') {
     if (message.channel.parentId === CATEGORY_ID) {
       try {
         const guild = message.guild;
         const channel = message.channel;
         
-        // إخفاء الروم عن العضو وعن رول السبورت، وإبقاؤه لرول الإدارة والأدمن
-        await channel.permissionOverwrites.edit(SUPPORT_ROLE_ID, { ViewChannel: false });
-        
-        // جلب صاحب التذكرة من اسم الروم أو أول مبرمج (يتم إخفاؤه أيضاً عن العضو)
+        let ownerId = null;
         const permissionEntries = channel.permissionOverwrites.cache.values();
         for (const entry of permissionEntries) {
-          if (entry.type === 1 && entry.id !== guild.ownerId) { // Member permission
-            await channel.permissionOverwrites.edit(entry.id, { ViewChannel: false });
+          if (entry.type === 1 && entry.id !== guild.ownerId) {
+            ownerId = entry.id;
+            break;
           }
         }
 
-        // إعطاء الروم صلاحية الرؤية للإدارة فقط
+        // إذا الكاتب هو صاحب التذكرة، امنعه من الإغلاق
+        if (message.author.id === ownerId && !message.member.roles.cache.has(SUPPORT_ROLE_ID) && !message.member.permissions.has(PermissionsBitField.Flags.Administrator)) {
+          await message.reply({ content: 'لا يمكنك إغلاق تذكرتك بنفسك!', ephemeral: true });
+          return;
+        }
+
+        await channel.permissionOverwrites.edit(SUPPORT_ROLE_ID, { ViewChannel: false });
+        if (ownerId) {
+          await channel.permissionOverwrites.edit(ownerId, { ViewChannel: false });
+        }
+
         await channel.permissionOverwrites.edit(ADMIN_ROLE_ID, { ViewChannel: true, SendMessages: true, ReadMessageHistory: true });
 
-        // تعديل أزرار الرسالة الأخيرة لتصبح زر "فتح" فقط بدون إيموجيات وبلون Secondary
         const openRow = new ActionRowBuilder().addComponents(
           new ButtonBuilder().setCustomId('ticket_open').setLabel('فتح').setStyle(ButtonStyle.Secondary)
         );
@@ -161,7 +168,6 @@ client.on('messageCreate', async message => {
   }
 });
 
-// التعامل مع التفاعلات (القوائم المنسدلة والأزرار)
 client.on('interactionCreate', async interaction => {
   if (interaction.isStringSelectMenu() && interaction.customId === 'ticket_select_menu') {
     const guild = interaction.guild;
@@ -220,10 +226,12 @@ client.on('interactionCreate', async interaction => {
         .setImage(BANNER_IMAGE_URL)
         .setColor('#2b2d31');
 
+      // 4 أزرار: إغلاق، استلام، استدعاء، إضافة
       const controlRow = new ActionRowBuilder().addComponents(
         new ButtonBuilder().setCustomId('ticket_close').setLabel('اغلاق').setStyle(ButtonStyle.Secondary),
         new ButtonBuilder().setCustomId('ticket_claim').setLabel('استلام').setStyle(ButtonStyle.Secondary),
-        new ButtonBuilder().setCustomId('ticket_summon').setLabel('استدعاء').setStyle(ButtonStyle.Secondary)
+        new ButtonBuilder().setCustomId('ticket_summon').setLabel('استدعاء').setStyle(ButtonStyle.Secondary),
+        new ButtonBuilder().setCustomId('ticket_add').setLabel('اضافه').setStyle(ButtonStyle.Secondary)
       );
 
       await ticketChannel.send({
@@ -240,6 +248,36 @@ client.on('interactionCreate', async interaction => {
     return;
   }
 
+  // التعامل مع Modal زر الإضافة
+  if (interaction.isModalSubmit() && interaction.customId === 'ticket_add_modal') {
+    const userInput = interaction.fields.getTextInputValue('user_input').trim();
+    const channel = interaction.channel;
+    const member = interaction.member;
+
+    let targetUserId = userInput.replace(/<@!?&?(\d+)>/g, '$1');
+
+    try {
+      const userToAdd = await interaction.guild.members.fetch(targetUserId).catch(() => null);
+      if (!userToAdd) {
+        await interaction.reply({ content: 'لم يتم العثور على هذا المستخدم، تأكد من اليوزر أو المنشن الصحيح.', ephemeral: true });
+        return;
+      }
+
+      await channel.permissionOverwrites.edit(userToAdd.id, {
+        ViewChannel: true,
+        SendMessages: true,
+        ReadMessageHistory: true
+      });
+
+      await interaction.reply({ content: 'تم', ephemeral: true });
+      await channel.send({ content: `تمت إضافة العضو <@${userToAdd.id}> إلى التذكرة بواسطة <@${member.id}>.` });
+    } catch (e) {
+      console.error(e);
+      await interaction.reply({ content: 'حدث خطأ أثناء إضافة العضو.', ephemeral: true });
+    }
+    return;
+  }
+
   if (interaction.isButton()) {
     const customId = interaction.customId;
     const channel = interaction.channel;
@@ -248,31 +286,46 @@ client.on('interactionCreate', async interaction => {
     const isSupport = member.roles.cache.has(SUPPORT_ROLE_ID) || member.permissions.has(PermissionsBitField.Flags.Administrator);
     const isAdmin = member.roles.cache.has(ADMIN_ROLE_ID) || member.permissions.has(PermissionsBitField.Flags.Administrator);
 
-    // التحقق من أن العضو العادي لا يضغط الأزرار المخصصة للسبورت
-    if (!isSupport && !isAdmin && customId !== 'ticket_close') {
-      await interaction.reply({ content: `هذا الزر مخصص لـ <@&${SUPPORT_ROLE_ID}>`, ephemeral: true });
-      return;
+    // معرفة من هو صاحب التذكرة الفعلي
+    let ownerId = null;
+    const permissionEntries = channel.permissionOverwrites.cache.values();
+    for (const entry of permissionEntries) {
+      if (entry.type === 1 && entry.id !== interaction.guild.ownerId) {
+        ownerId = entry.id;
+        break;
+      }
     }
+    const isOwner = (member.id === ownerId);
 
-    // زر استدعاء (Summon)
-    if (customId === 'ticket_summon') {
-      const now = Date.now();
-      const cooldownTime = 15000; // 15 ثانية
-      const lastSummon = summonCooldowns.get(member.id) || 0;
-
-      if (now - lastSummon < cooldownTime) {
-        const remainingSeconds = Math.ceil((cooldownTime - (now - lastSummon)) / 1000);
-        await interaction.reply({ content: `يرجى الانتظار ${remainingSeconds} ثانية قبل استخدام زر الاستدعاء مرة أخرى.`, ephemeral: true });
+    // زر إغلاق: صاحب التذكرة لا يمكنه الضغط عليه (يمنع تماماً)، بينما السبورت أو غيره يقدرون
+    if (customId === 'ticket_close') {
+      if (isOwner && !isSupport && !isAdmin) {
+        await interaction.reply({ content: 'لا يمكنك إغلاق تذكرتك بنفسك!', ephemeral: true });
         return;
       }
 
-      summonCooldowns.set(member.id, now);
-      await channel.send({ content: `تم استدعاء الدعم الفني بواسطة <@${member.id}>، نرجو الحضور في أسرع وقت! <@&${SUPPORT_ROLE_ID}>` });
-      await interaction.reply({ content: 'تم إرسال تنبيه الاستدعاء بنجاح.', ephemeral: true });
+      try {
+        await interaction.reply({ content: 'جاري إغلاق التكت...', ephemeral: true });
+        
+        await channel.permissionOverwrites.edit(SUPPORT_ROLE_ID, { ViewChannel: false });
+        if (ownerId) {
+          await channel.permissionOverwrites.edit(ownerId, { ViewChannel: false });
+        }
+        await channel.permissionOverwrites.edit(ADMIN_ROLE_ID, { ViewChannel: true, SendMessages: true, ReadMessageHistory: true });
+
+        const openRow = new ActionRowBuilder().addComponents(
+          new ButtonBuilder().setCustomId('ticket_open').setLabel('فتح').setStyle(ButtonStyle.Secondary)
+        );
+
+        await interaction.message.edit({ components: [openRow] }).catch(() => {});
+        await channel.send({ content: `تم إغلاق التذكرة بواسطة <@${member.id}>.` });
+      } catch (e) {
+        console.error(e);
+      }
       return;
     }
 
-    // زر استلام (Claim)
+    // زر استلام: لو العضو هو صاحب التذكرة (وليس سبورت) لا يستطيع الاستلام. لو مو صاحب التذكرة (وكان سبورت) يقدر. صاحب التذكرة يقدر يستلم لو فتح تذكرة شخص آخر؟ حسب الطلب: "لو انه اللي فاتح التذكرة يقدر يستلم لكن لو انه هو اللي مو فاتح التذكرة هذا يقدر يستلم... ولازم يكون سبورت"
     if (customId === 'ticket_claim') {
       if (!isSupport) {
         await interaction.reply({ content: `هذا الزر مخصص لـ <@&${SUPPORT_ROLE_ID}>`, ephemeral: true });
@@ -285,7 +338,9 @@ client.on('interactionCreate', async interaction => {
 
         const updatedRow = new ActionRowBuilder().addComponents(
           new ButtonBuilder().setCustomId('ticket_close').setLabel('اغلاق').setStyle(ButtonStyle.Secondary),
-          new ButtonBuilder().setCustomId('ticket_open').setLabel('فتح').setStyle(ButtonStyle.Secondary)
+          new ButtonBuilder().setCustomId('ticket_open').setLabel('فتح').setStyle(ButtonStyle.Secondary),
+          new ButtonBuilder().setCustomId('ticket_summon').setLabel('استدعاء').setStyle(ButtonStyle.Secondary),
+          new ButtonBuilder().setCustomId('ticket_add').setLabel('اضافه').setStyle(ButtonStyle.Secondary)
         );
 
         await interaction.message.edit({ components: [updatedRow] }).catch(() => {});
@@ -298,6 +353,95 @@ client.on('interactionCreate', async interaction => {
       return;
     }
 
+    // زر إضافة: فقط لمستلم التذكرة أو السبورت المخول
+    if (customId === 'ticket_add') {
+      if (!isSupport) {
+        await interaction.reply({ content: `هذا الزر مخصص لـ <@&${SUPPORT_ROLE_ID}>`, ephemeral: true });
+        return;
+      }
+
+      const modal = new ModalBuilder()
+        .setCustomId('ticket_add_modal')
+        .setTitle('إضافة عضو إلى التذكرة');
+
+      const userInputComponent = new TextInputBuilder()
+        .setCustomId('user_input')
+        .setLabel('أدخل يوزر أو منشن العضو المراد إضافته')
+        .setStyle(TextInputStyle.Short)
+        .setRequired(true);
+
+      modal.addComponents(new ActionRowBuilder().addComponents(userInputComponent));
+      await interaction.showModal(modal);
+      return;
+    }
+
+    // زر استدعاء (Summon): يمنشن السبورت لمدة ثانيتين ثم يحذف، ويخفي زر الاستدعاء للمستخدم لمدة 15 ثانية ثم يعود
+    if (customId === 'ticket_summon') {
+      const now = Date.now();
+      const cooldownTime = 15000; // 15 ثانية
+      const lastSummon = summonCooldowns.get(member.id) || 0;
+
+      if (now - lastSummon < cooldownTime) {
+        const remainingSeconds = Math.ceil((cooldownTime - (now - lastSummon)) / 1000);
+        await interaction.reply({ content: `يرجى الانتظار ${remainingSeconds} ثانية قبل استخدام زر الاستدعاء مرة أخرى.`, ephemeral: true });
+        return;
+      }
+
+      summonCooldowns.set(member.id, now);
+
+      await interaction.deferReply({ ephemeral: true });
+      await interaction.deleteReply().catch(() => {});
+
+      // إرسال المنشن للسبورت وحذفه بعد ثانيتين (2000 مللي ثانية) بدون كلام طويل وبدون رسالة زرقاء ظاهرة
+      try {
+        const pingMsg = await channel.send({ content: `<@&${SUPPORT_ROLE_ID}>` });
+        setTimeout(async () => {
+          await pingMsg.delete().catch(() => {});
+        }, 2000);
+      } catch (e) {}
+
+      // إخفاء زر الاستدعاء لمدة 15 ثانية ثم إعادته
+      try {
+        const currentMsg = interaction.message;
+        const oldComponents = currentMsg.components[0].components;
+
+        const tempRow = new ActionRowBuilder().addComponents(
+          oldomp => oldComponents.map(btn => {
+            if (btn.data.custom_id === 'ticket_summon') {
+              return ButtonBuilder.from(btn).setDisabled(true);
+            }
+            return ButtonBuilder.from(btn);
+          })
+        );
+        // تحديث بسيط للزر ليصبح معطلاً مؤقتاً
+        const disabledRow = new ActionRowBuilder().addComponents(
+          oldComponents.map(btn => {
+            if (btn.data.custom_id === 'ticket_summon') {
+              return new ButtonBuilder().setCustomId('ticket_summon').setLabel('استدعاء').setStyle(ButtonStyle.Secondary).setDisabled(true);
+            }
+            return ButtonBuilder.from(btn);
+          })
+        );
+
+        await currentMsg.edit({ components: [disabledRow] }).catch(() => {});
+
+        setTimeout(async () => {
+          const activeRow = new ActionRowBuilder().addComponents(
+            oldComponents.map(btn => {
+              if (btn.data.custom_id === 'ticket_summon') {
+                return new ButtonBuilder().setCustomId('ticket_summon').setLabel('استدعاء').setStyle(ButtonStyle.Secondary).setDisabled(false);
+              }
+              return ButtonBuilder.from(btn);
+            })
+          );
+          await currentMsg.edit({ components: [activeRow] }).catch(() => {});
+        }, 15000);
+
+      } catch (e) {}
+
+      return;
+    }
+
     // زر فتح (Open)
     if (customId === 'ticket_open') {
       if (!isAdmin && !isSupport) {
@@ -307,51 +451,21 @@ client.on('interactionCreate', async interaction => {
 
       try {
         await channel.permissionOverwrites.edit(SUPPORT_ROLE_ID, { ViewChannel: true });
+        if (ownerId) {
+          await channel.permissionOverwrites.edit(ownerId, { ViewChannel: true, SendMessages: true });
+        }
 
-        // إرجاع الأزرار الطبيعية لتظهر عند صاحب التذكرة فقط حسب الطلب
         const normalRow = new ActionRowBuilder().addComponents(
           new ButtonBuilder().setCustomId('ticket_close').setLabel('اغلاق').setStyle(ButtonStyle.Secondary),
           new ButtonBuilder().setCustomId('ticket_claim').setLabel('استلام').setStyle(ButtonStyle.Secondary),
-          new ButtonBuilder().setCustomId('ticket_summon').setLabel('استدعاء').setStyle(ButtonStyle.Secondary)
+          new ButtonBuilder().setCustomId('ticket_summon').setLabel('استدعاء').setStyle(ButtonStyle.Secondary),
+          new ButtonBuilder().setCustomId('ticket_add').setLabel('اضافه').setStyle(ButtonStyle.Secondary)
         );
 
         await interaction.message.edit({ components: [normalRow] }).catch(() => {});
         await interaction.reply({ content: 'تم فتح التكت وإظهاره.', ephemeral: true });
       } catch (e) {
         await interaction.reply({ content: 'حدث خطأ أثناء فتح التكت.', ephemeral: true });
-      }
-      return;
-    }
-
-    // زر إغلاق (Close)
-    if (customId === 'ticket_close') {
-      try {
-        await interaction.reply({ content: 'جاري إغلاق التكت...', ephemeral: true });
-        
-        const guild = interaction.guild;
-        
-        // إخفاء الروم عن السبورت
-        await channel.permissionOverwrites.edit(SUPPORT_ROLE_ID, { ViewChannel: false });
-
-        // إخفاء الروم عن صاحب التذكرة
-        const permissionEntries = channel.permissionOverwrites.cache.values();
-        for (const entry of permissionEntries) {
-          if (entry.type === 1 && entry.id !== guild.ownerId) {
-            await channel.permissionOverwrites.edit(entry.id, { ViewChannel: false });
-          }
-        }
-
-        // إظهار الروم لرول الإدارة المحدد
-        await channel.permissionOverwrites.edit(ADMIN_ROLE_ID, { ViewChannel: true, SendMessages: true, ReadMessageHistory: true });
-
-        const openRow = new ActionRowBuilder().addComponents(
-          new ButtonBuilder().setCustomId('ticket_open').setLabel('فتح').setStyle(ButtonStyle.Secondary)
-        );
-
-        await interaction.message.edit({ components: [openRow] }).catch(() => {});
-        await channel.send({ content: `تم إغلاق التذكرة بواسطة <@${member.id}>.` });
-      } catch (e) {
-        console.error(e);
       }
       return;
     }
