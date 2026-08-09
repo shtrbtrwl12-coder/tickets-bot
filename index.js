@@ -42,7 +42,24 @@ const ADMIN_ROLE_ID = '1535375782736560128';
 const BANNER_IMAGE_URL = 'https://cdn.discordapp.com/attachments/1531644529818472458/1535769197286793226/2F8C5A40-B030-4AAE-A84C-975BDB26B9CC.png?ex=6a78f805&is=6a77a685&hm=f64c0b9b99314f73927eb468b1b2ded1b15be82de1a30b069aae62308c2213ce&';
 const TARGET_CHANNEL_ID = '1535496283115225208';
 
+// الآيديات الجديدة المضافة
+const NO_TICKET_ROLE_ID = '1535843524371808306';
+const NO_TICKET_USER_1 = '1531638767352545420';
+const NO_TICKET_USER_2 = '1493371500676518000';
+const TICKET_LOG_CHANNEL_ID = '1535856331666358413';
+const TICKET_ADMIN_SPECIAL_ROLE_ID = '1535856845330194432';
+
 const ticketSummonCooldowns = new Map();
+const ticketClaimMap = new Map(); // لتخزين من استلم التكت
+
+async function sendTicketLog(guild, content) {
+  try {
+    const logChannel = await guild.channels.fetch(TICKET_LOG_CHANNEL_ID).catch(() => null);
+    if (logChannel && logChannel.isTextBased()) {
+      await logChannel.send({ content: content }).catch(() => {});
+    }
+  } catch (e) {}
+}
 
 client.once('ready', async () => {
   console.log(`Tickets Bot logged in as ${client.user.tag}!`);
@@ -79,31 +96,13 @@ client.once('ready', async () => {
   }
 });
 
-// مراقبة خروج الأعضاء من السيرفر لإغلاق تذاكرهم تلقائياً
-client.on('guildMemberRemove', async member => {
-  try {
-    const guild = member.guild;
-    const channels = await guild.channels.fetch();
-    for (const [, channel] of channels) {
-      if (channel && channel.parentId === CATEGORY_ID && channel.isTextBased()) {
-        let ownerId = null;
-        for (const [, entry] of channel.permissionOverwrites.cache) {
-          if (entry.type === 1 && entry.id !== guild.ownerId) {
-            ownerId = entry.id;
-            break;
-          }
-        }
-        if (ownerId === member.id) {
-          await channel.delete().catch(() => {});
-        }
-      }
-    }
-  } catch (e) {
-    console.error(e);
-  }
-});
-
+// منع بوت السيستم (أو أي بوت آخر غير هذا البوت) من التكلم بروم لوج التكت
 client.on('messageCreate', async message => {
+  if (message.channel.id === TICKET_LOG_CHANNEL_ID && message.author.bot && message.author.id !== client.user.id) {
+    await message.delete().catch(() => {});
+    return;
+  }
+
   if (message.author.bot) return;
 
   const contentLower = message.content.toLowerCase().trim();
@@ -141,6 +140,7 @@ client.on('messageCreate', async message => {
         }
 
         await channel.permissionOverwrites.edit(ADMIN_ROLE_ID, { ViewChannel: true, SendMessages: true, ReadMessageHistory: true });
+        await channel.permissionOverwrites.edit(TICKET_ADMIN_SPECIAL_ROLE_ID, { ViewChannel: true, SendMessages: false, ReadMessageHistory: true });
 
         const openRow = new ActionRowBuilder().addComponents(
           new ButtonBuilder().setCustomId('ticket_open').setLabel('فتح').setStyle(ButtonStyle.Secondary)
@@ -153,6 +153,10 @@ client.on('messageCreate', async message => {
         }
 
         await message.channel.send({ content: `تم إغلاق التذكرة بواسطة <@${message.author.id}>.` });
+
+        // إرسال اللوج الخاص بإغلاق التذكرة
+        let claimUserMention = ticketClaimMap.get(channel.id) ? `<@${ticketClaimMap.get(channel.id)}>` : 'محد استلمها';
+        await sendTicketLog(guild, `من فتح التكت: <@${ownerId || 'unknown'}> | من استلم التكت: ${claimUserMention} | من قفل التكت: <@${message.author.id}>`);
       } catch (e) {
         console.error(e);
       }
@@ -189,10 +193,99 @@ client.on('messageCreate', async message => {
   }
 });
 
+// مراقبة إعطاء أو سحب رول النو رول للرد بالرياكشن المناسب
+client.on('guildMemberUpdate', async (oldMember, newMember) => {
+  try {
+    const hadRole = oldMember.roles.cache.has(NO_TICKET_ROLE_ID);
+    const hasRole = newMember.roles.cache.has(NO_TICKET_ROLE_ID);
+
+    if (hadRole !== hasRole) {
+      const fetchedLogs = await newMember.guild.fetchAuditLogs({ limit: 1, type: 24 }); // MemberRoleUpdate
+      const logEntry = fetchedLogs.entries.first();
+      if (logEntry && logEntry.target.id === newMember.id && (Date.now() - logEntry.createdTimestamp < 5000)) {
+        const executor = logEntry.executor;
+        if (executor && !executor.bot) {
+          const channel = logEntry.channel || (await newMember.guild.channels.fetch().then(channels => channels.find(c => c.isTextBased())));
+          if (channel) {
+            const messages = await channel.messages.fetch({ limit: 5 });
+            const targetMsg = messages.find(m => m.author.id === executor.id);
+            if (targetMsg) {
+              await targetMsg.react('✅').catch(() => {});
+            } else {
+              await channel.send({ content: '✅' }).catch(() => {});
+            }
+          }
+        }
+      }
+    }
+  } catch (e) {
+    try {
+      // رد رياكشن خطأ عند حدوث أي خطأ برول النو رول
+      const channels = await newMember.guild.channels.fetch();
+      const firstText = channels.find(c => c.isTextBased());
+      if (firstText) {
+        const msgs = await firstText.messages.fetch({ limit: 5 });
+        const lastMsg = msgs.first();
+        if (lastMsg) await lastMsg.react('❌').catch(() => {});
+      }
+    } catch (err) {}
+  }
+
+  // مراقبة خروج الأعضاء من السيرفر لإغلاق تذاكرهم تلقائياً
+  try {
+    const guild = newMember.guild;
+    if (newMember.partial) return;
+  } catch (e) {}
+});
+
+client.on('guildMemberRemove', async member => {
+  try {
+    const guild = member.guild;
+    const channels = await guild.channels.fetch();
+    for (const [, channel] of channels) {
+      if (channel && channel.parentId === CATEGORY_ID && channel.isTextBased()) {
+        let ownerId = null;
+        for (const [, entry] of channel.permissionOverwrites.cache) {
+          if (entry.type === 1 && entry.id !== guild.ownerId) {
+            ownerId = entry.id;
+            break;
+          }
+        }
+        if (ownerId === member.id) {
+          await channel.delete().catch(() => {});
+        }
+      }
+    }
+  } catch (e) {
+    console.error(e);
+  }
+});
+
 client.on('interactionCreate', async interaction => {
   if (interaction.isStringSelectMenu() && interaction.customId === 'ticket_select_menu') {
     const guild = interaction.guild;
     const member = interaction.member;
+
+    // التحقق مما إذا كان المستخدم يمتلك رول النو رول الجديد
+    if (member.roles.cache.has(NO_TICKET_ROLE_ID)) {
+      await interaction.reply({ 
+        content: `عليك نو تكت اذا هذا تبغى ينفك عنك تواصل مع <@${NO_TICKET_USER_1}> و <@${NO_TICKET_USER_2}>`, 
+        ephemeral: true 
+      });
+      // إعادة تحديث رسالة المنيو لتفريغ أي علامة صح معلقة
+      const selectMenuClean = new StringSelectMenuBuilder()
+        .setCustomId('ticket_select_menu')
+        .setPlaceholder('يرجى اختيار نوع التذكرة')
+        .addOptions([
+          { label: 'التواصل مع الإدارة', value: 'ticket_management' },
+          { label: 'الشكاوي', value: 'ticket_complaints' },
+          { label: 'طلب رول', value: 'ticket_roles' },
+          { label: 'اخرى', value: 'ticket_other' }
+        ]);
+      await interaction.message.edit({ components: [new ActionRowBuilder().addComponents(selectMenuClean)] }).catch(() => {});
+      return;
+    }
+
     const selectedValue = interaction.values[0];
 
     // التحقق عما إذا كان لدى المستخدم تذكرة مفتوحة مسبقاً (يجب إغلاق الأولى أولاً)
@@ -209,7 +302,6 @@ client.on('interactionCreate', async interaction => {
             }
           }
           if (ownerId === member.id) {
-            // التحقق هل التذكرة مفتوحة وليست مغلقة (إذا كان السبورت يقدر يشاهدها يعني مفتوحة)
             const supportOverwrite = channel.permissionOverwrites.cache.get(SUPPORT_ROLE_ID);
             const isOpen = !supportOverwrite || supportOverwrite.allow.has(PermissionsBitField.Flags.ViewChannel);
             if (isOpen) {
@@ -222,7 +314,6 @@ client.on('interactionCreate', async interaction => {
 
       if (hasOpenTicket) {
         await interaction.reply({ content: 'لديك تذكرة مفتوحة بالفعل، يجب إغلاقها أولاً قبل فتح تذكرة جديدة.', ephemeral: true });
-        // إعادة تحديث رسالة المنيو لتفريغ أي علامة صح معلقة
         const selectMenu = new StringSelectMenuBuilder()
           .setCustomId('ticket_select_menu')
           .setPlaceholder('يرجى اختيار نوع التذكرة')
@@ -283,6 +374,16 @@ client.on('interactionCreate', async interaction => {
               PermissionsBitField.Flags.SendMessages,
               PermissionsBitField.Flags.ReadMessageHistory
             ]
+          },
+          {
+            id: TICKET_ADMIN_SPECIAL_ROLE_ID,
+            allow: [
+              PermissionsBitField.Flags.ViewChannel,
+              PermissionsBitField.Flags.ReadMessageHistory
+            ],
+            deny: [
+              PermissionsBitField.Flags.SendMessages
+            ]
           }
         ]
       });
@@ -335,7 +436,6 @@ client.on('interactionCreate', async interaction => {
         }
       }, checkInterval);
 
-      // إعادة ضبط رسالة المنيو لتفريغ علامة الصح تماماً لتظهر القائمة نظيفة مثل الصورة الأولى
       const selectMenuClean = new StringSelectMenuBuilder()
         .setCustomId('ticket_select_menu')
         .setPlaceholder('يرجى اختيار نوع التذكرة')
@@ -426,6 +526,7 @@ client.on('interactionCreate', async interaction => {
           await channel.permissionOverwrites.edit(ownerId, { ViewChannel: false });
         }
         await channel.permissionOverwrites.edit(ADMIN_ROLE_ID, { ViewChannel: true, SendMessages: true, ReadMessageHistory: true });
+        await channel.permissionOverwrites.edit(TICKET_ADMIN_SPECIAL_ROLE_ID, { ViewChannel: true, SendMessages: false, ReadMessageHistory: true });
 
         const openRow = new ActionRowBuilder().addComponents(
           new ButtonBuilder().setCustomId('ticket_open').setLabel('فتح').setStyle(ButtonStyle.Secondary)
@@ -433,6 +534,9 @@ client.on('interactionCreate', async interaction => {
 
         await interaction.message.edit({ components: [openRow] }).catch(() => {});
         await channel.send({ content: `تم إغلاق التذكرة بواسطة <@${member.id}>.` });
+
+        let claimUserMention = ticketClaimMap.get(channel.id) ? `<@${ticketClaimMap.get(channel.id)}>` : 'محد استلمها';
+        await sendTicketLog(interaction.guild, `من فتح التكت: <@${ownerId || 'unknown'}> | من استلم التكت: ${claimUserMention} | من قفل التكت: <@${member.id}>`);
       } catch (e) {
         console.error(e);
       }
@@ -448,6 +552,8 @@ client.on('interactionCreate', async interaction => {
       try {
         await channel.permissionOverwrites.edit(SUPPORT_ROLE_ID, { ViewChannel: false });
         await channel.permissionOverwrites.edit(member.id, { ViewChannel: true, SendMessages: true });
+        
+        ticketClaimMap.set(channel.id, member.id);
 
         const updatedRow = new ActionRowBuilder().addComponents(
           new ButtonBuilder().setCustomId('ticket_close').setLabel('اغلاق').setStyle(ButtonStyle.Secondary),
@@ -556,6 +662,7 @@ client.on('interactionCreate', async interaction => {
         if (ownerId) {
           await channel.permissionOverwrites.edit(ownerId, { ViewChannel: true, SendMessages: true });
         }
+        await channel.permissionOverwrites.edit(TICKET_ADMIN_SPECIAL_ROLE_ID, { ViewChannel: true, SendMessages: false, ReadMessageHistory: true });
 
         const normalRow = new ActionRowBuilder().addComponents(
           new ButtonBuilder().setCustomId('ticket_close').setLabel('اغلاق').setStyle(ButtonStyle.Secondary),
