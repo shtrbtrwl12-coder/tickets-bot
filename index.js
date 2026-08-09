@@ -43,7 +43,6 @@ const BANNER_IMAGE_URL = 'https://cdn.discordapp.com/attachments/153164452981847
 const TARGET_CHANNEL_ID = '1535496283115225208';
 
 const ticketSummonCooldowns = new Map();
-const userTicketCooldowns = new Map();
 
 client.once('ready', async () => {
   console.log(`Tickets Bot logged in as ${client.user.tag}!`);
@@ -196,18 +195,49 @@ client.on('interactionCreate', async interaction => {
     const member = interaction.member;
     const selectedValue = interaction.values[0];
 
-    // التحقق من كولداون دقيقة واحدة بين التذاكر
-    const now = Date.now();
-    const cooldownTime = 60000; // 60 ثانية
-    const lastTicketTime = userTicketCooldowns.get(member.id) || 0;
+    // التحقق عما إذا كان لدى المستخدم تذكرة مفتوحة مسبقاً (يجب إغلاق الأولى أولاً)
+    try {
+      const channels = await guild.channels.fetch();
+      let hasOpenTicket = false;
+      for (const [, channel] of channels) {
+        if (channel && channel.parentId === CATEGORY_ID && channel.isTextBased()) {
+          let ownerId = null;
+          for (const [, entry] of channel.permissionOverwrites.cache) {
+            if (entry.type === 1 && entry.id !== guild.ownerId) {
+              ownerId = entry.id;
+              break;
+            }
+          }
+          if (ownerId === member.id) {
+            // التحقق هل التذكرة مفتوحة وليست مغلقة (إذا كان السبورت يقدر يشاهدها يعني مفتوحة)
+            const supportOverwrite = channel.permissionOverwrites.cache.get(SUPPORT_ROLE_ID);
+            const isOpen = !supportOverwrite || supportOverwrite.allow.has(PermissionsBitField.Flags.ViewChannel);
+            if (isOpen) {
+              hasOpenTicket = true;
+              break;
+            }
+          }
+        }
+      }
 
-    if (now - lastTicketTime < cooldownTime) {
-      const remainingSeconds = Math.ceil((cooldownTime - (now - lastTicketTime)) / 1000);
-      await interaction.reply({ content: `يرجى تحلى بالصبر، يرجى الانتظار ${remainingSeconds} ثانية.`, ephemeral: true });
-      return;
+      if (hasOpenTicket) {
+        await interaction.reply({ content: 'لديك تذكرة مفتوحة بالفعل، يجب إغلاقها أولاً قبل فتح تذكرة جديدة.', ephemeral: true });
+        // إعادة تحديث رسالة المنيو لتفريغ أي علامة صح معلقة
+        const selectMenu = new StringSelectMenuBuilder()
+          .setCustomId('ticket_select_menu')
+          .setPlaceholder('يرجى اختيار نوع التذكرة')
+          .addOptions([
+            { label: 'التواصل مع الإدارة', value: 'ticket_management' },
+            { label: 'الشكاوي', value: 'ticket_complaints' },
+            { label: 'طلب رول', value: 'ticket_roles' },
+            { label: 'اخرى', value: 'ticket_other' }
+          ]);
+        await interaction.message.edit({ components: [new ActionRowBuilder().addComponents(selectMenu)] }).catch(() => {});
+        return;
+      }
+    } catch (e) {
+      console.error(e);
     }
-
-    userTicketCooldowns.set(member.id, now);
 
     let ticketTypeName = 'أخرى';
     if (selectedValue === 'ticket_management') ticketTypeName = 'التواصل مع الإدارة';
@@ -276,8 +306,8 @@ client.on('interactionCreate', async interaction => {
       });
 
       // نظام الحذف التلقائي بعد 12 ساعة إذا لم يرد صاحب التذكرة
-      const checkInterval = 60000; // فحص كل دقيقة
-      const maxTime = 12 * 60 * 60 * 1000; // 12 ساعة
+      const checkInterval = 60000;
+      const maxTime = 12 * 60 * 60 * 1000;
       const startTime = Date.now();
 
       const autoDeleteTimer = setInterval(async () => {
@@ -289,7 +319,6 @@ client.on('interactionCreate', async interaction => {
           }
 
           const messages = await fetchedChannel.messages.fetch({ limit: 20 });
-          // التحقق مما إذا كان صاحب التذكرة قد أرسل رسالة أم لا
           const ownerHasSpoken = messages.some(m => m.author.id === member.id && !m.author.bot);
 
           if (ownerHasSpoken) {
@@ -305,6 +334,18 @@ client.on('interactionCreate', async interaction => {
           clearInterval(autoDeleteTimer);
         }
       }, checkInterval);
+
+      // إعادة ضبط رسالة المنيو لتفريغ علامة الصح تماماً لتظهر القائمة نظيفة مثل الصورة الأولى
+      const selectMenuClean = new StringSelectMenuBuilder()
+        .setCustomId('ticket_select_menu')
+        .setPlaceholder('يرجى اختيار نوع التذكرة')
+        .addOptions([
+          { label: 'التواصل مع الإدارة', value: 'ticket_management' },
+          { label: 'الشكاوي', value: 'ticket_complaints' },
+          { label: 'طلب رول', value: 'ticket_roles' },
+          { label: 'اخرى', value: 'ticket_other' }
+        ]);
+      await interaction.message.edit({ components: [new ActionRowBuilder().addComponents(selectMenuClean)] }).catch(() => {});
 
       await interaction.editReply({ content: `تم إنشاء التكت بنجاح: <#${ticketChannel.id}>` });
     } catch (e) {
@@ -420,7 +461,7 @@ client.on('interactionCreate', async interaction => {
         await interaction.reply({ content: 'تم', ephemeral: true });
       } catch (e) {
         console.error(e);
-        await interaction.reply({ content: 'حدث خطأ أثناء استلاست التكت.', ephemeral: true });
+        await interaction.reply({ content: 'حدث خطأ أثناء استلام التكت.', ephemeral: true });
       }
       return;
     }
@@ -472,7 +513,6 @@ client.on('interactionCreate', async interaction => {
       return;
     }
 
-    // زر "استدعاء" الجديد (يرسل في الخاص لصاحب التذكرة حصرياً بدون شات عام)
     if (customId === 'ticket_summon_member') {
       if (!isSupport) {
         await interaction.reply({ content: `هذا الزر مخصص لـ <@&${SUPPORT_ROLE_ID}>`, ephemeral: true });
@@ -480,7 +520,7 @@ client.on('interactionCreate', async interaction => {
       }
 
       const now = Date.now();
-      const cooldownTime = 15 * 60 * 1000; // 15 دقيقة
+      const cooldownTime = 15 * 60 * 1000;
       const lastSummon = ticketSummonCooldowns.get(channel.id + '_member') || 0;
 
       if (now - lastSummon < cooldownTime) {
