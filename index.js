@@ -43,6 +43,7 @@ const BANNER_IMAGE_URL = 'https://cdn.discordapp.com/attachments/153164452981847
 const TARGET_CHANNEL_ID = '1535496283115225208';
 
 const ticketSummonCooldowns = new Map();
+const userTicketCooldowns = new Map();
 
 client.once('ready', async () => {
   console.log(`Tickets Bot logged in as ${client.user.tag}!`);
@@ -79,6 +80,30 @@ client.once('ready', async () => {
   }
 });
 
+// مراقبة خروج الأعضاء من السيرفر لإغلاق تذاكرهم تلقائياً
+client.on('guildMemberRemove', async member => {
+  try {
+    const guild = member.guild;
+    const channels = await guild.channels.fetch();
+    for (const [, channel] of channels) {
+      if (channel && channel.parentId === CATEGORY_ID && channel.isTextBased()) {
+        let ownerId = null;
+        for (const [, entry] of channel.permissionOverwrites.cache) {
+          if (entry.type === 1 && entry.id !== guild.ownerId) {
+            ownerId = entry.id;
+            break;
+          }
+        }
+        if (ownerId === member.id) {
+          await channel.delete().catch(() => {});
+        }
+      }
+    }
+  } catch (e) {
+    console.error(e);
+  }
+});
+
 client.on('messageCreate', async message => {
   if (message.author.bot) return;
 
@@ -100,8 +125,7 @@ client.on('messageCreate', async message => {
         const channel = message.channel;
         
         let ownerId = null;
-        const permissionEntries = channel.permissionOverwrites.cache.values();
-        for (const entry of permissionEntries) {
+        for (const [, entry] of channel.permissionOverwrites.cache) {
           if (entry.type === 1 && entry.id !== guild.ownerId) {
             ownerId = entry.id;
             break;
@@ -119,7 +143,6 @@ client.on('messageCreate', async message => {
 
         await channel.permissionOverwrites.edit(ADMIN_ROLE_ID, { ViewChannel: true, SendMessages: true, ReadMessageHistory: true });
 
-        // زر فتح يظهر فقط لرول الإدارة المسؤول
         const openRow = new ActionRowBuilder().addComponents(
           new ButtonBuilder().setCustomId('ticket_open').setLabel('فتح').setStyle(ButtonStyle.Secondary)
         );
@@ -173,6 +196,19 @@ client.on('interactionCreate', async interaction => {
     const member = interaction.member;
     const selectedValue = interaction.values[0];
 
+    // التحقق من كولداون دقيقة واحدة بين التذاكر
+    const now = Date.now();
+    const cooldownTime = 60000; // 60 ثانية
+    const lastTicketTime = userTicketCooldowns.get(member.id) || 0;
+
+    if (now - lastTicketTime < cooldownTime) {
+      const remainingSeconds = Math.ceil((cooldownTime - (now - lastTicketTime)) / 1000);
+      await interaction.reply({ content: `يرجى تحلى بالصبر، يرجى الانتظار ${remainingSeconds} ثانية.`, ephemeral: true });
+      return;
+    }
+
+    userTicketCooldowns.set(member.id, now);
+
     let ticketTypeName = 'أخرى';
     if (selectedValue === 'ticket_management') ticketTypeName = 'التواصل مع الإدارة';
     else if (selectedValue === 'ticket_complaints') ticketTypeName = 'الشكاوي';
@@ -225,7 +261,6 @@ client.on('interactionCreate', async interaction => {
         .setImage(BANNER_IMAGE_URL)
         .setColor('#2b2d31');
 
-      // الأزرار: اغلاق، استلام، اداره، استدعاء، اضافه
       const controlRow = new ActionRowBuilder().addComponents(
         new ButtonBuilder().setCustomId('ticket_close').setLabel('اغلاق').setStyle(ButtonStyle.Secondary),
         new ButtonBuilder().setCustomId('ticket_claim').setLabel('استلام').setStyle(ButtonStyle.Secondary),
@@ -234,11 +269,42 @@ client.on('interactionCreate', async interaction => {
         new ButtonBuilder().setCustomId('ticket_add').setLabel('اضافه').setStyle(ButtonStyle.Secondary)
       );
 
-      await ticketChannel.send({
+      const ticketMsg = await ticketChannel.send({
         content: `<@${member.id}> | <@&${SUPPORT_ROLE_ID}>\n\nنوع التذكرة : **${ticketTypeName}**\n\n**اكتب مشكلتك قبل لانجي**`,
         embeds: [embed],
         components: [controlRow]
       });
+
+      // نظام الحذف التلقائي بعد 12 ساعة إذا لم يرد صاحب التذكرة
+      const checkInterval = 60000; // فحص كل دقيقة
+      const maxTime = 12 * 60 * 60 * 1000; // 12 ساعة
+      const startTime = Date.now();
+
+      const autoDeleteTimer = setInterval(async () => {
+        try {
+          const fetchedChannel = await guild.channels.fetch(ticketChannel.id).catch(() => null);
+          if (!fetchedChannel) {
+            clearInterval(autoDeleteTimer);
+            return;
+          }
+
+          const messages = await fetchedChannel.messages.fetch({ limit: 20 });
+          // التحقق مما إذا كان صاحب التذكرة قد أرسل رسالة أم لا
+          const ownerHasSpoken = messages.some(m => m.author.id === member.id && !m.author.bot);
+
+          if (ownerHasSpoken) {
+            clearInterval(autoDeleteTimer);
+            return;
+          }
+
+          if (Date.now() - startTime >= maxTime) {
+            clearInterval(autoDeleteTimer);
+            await fetchedChannel.delete().catch(() => {});
+          }
+        } catch (e) {
+          clearInterval(autoDeleteTimer);
+        }
+      }, checkInterval);
 
       await interaction.editReply({ content: `تم إنشاء التكت بنجاح: <#${ticketChannel.id}>` });
     } catch (e) {
@@ -248,7 +314,6 @@ client.on('interactionCreate', async interaction => {
     return;
   }
 
-  // التعامل مع Modal زر الإضافة بدقة
   if (interaction.isModalSubmit() && interaction.customId === 'ticket_add_modal') {
     const userInput = interaction.fields.getTextInputValue('user_input').trim();
     const channel = interaction.channel;
@@ -259,7 +324,6 @@ client.on('interactionCreate', async interaction => {
     try {
       let userToAdd = await interaction.guild.members.fetch(targetUserId).catch(() => null);
       
-      // إذا لم يتم العثور عليه بالآيدي أو المنشن، نبحث باليوزر (username)
       if (!userToAdd) {
         const query = userInput.toLowerCase().replace('@', '');
         const membersList = await interaction.guild.members.fetch();
@@ -300,8 +364,7 @@ client.on('interactionCreate', async interaction => {
     const isAdmin = member.roles.cache.has(ADMIN_ROLE_ID_VALUE) || member.permissions.has(PermissionsBitField.Flags.Administrator);
 
     let ownerId = null;
-    const permissionEntries = channel.permissionOverwrites.cache.values();
-    for (const entry of permissionEntries) {
+    for (const [, entry] of channel.permissionOverwrites.cache) {
       if (entry.type === 1 && entry.id !== interaction.guild.ownerId) {
         ownerId = entry.id;
         break;
@@ -309,7 +372,6 @@ client.on('interactionCreate', async interaction => {
     }
     const isOwner = (member.id === ownerId);
 
-    // زر إغلاق
     if (customId === 'ticket_close') {
       if (isOwner && !isSupport && !isAdmin) {
         return;
@@ -324,7 +386,6 @@ client.on('interactionCreate', async interaction => {
         }
         await channel.permissionOverwrites.edit(ADMIN_ROLE_ID, { ViewChannel: true, SendMessages: true, ReadMessageHistory: true });
 
-        // إظهار زر الفتح فقط لرول الإدارة
         const openRow = new ActionRowBuilder().addComponents(
           new ButtonBuilder().setCustomId('ticket_open').setLabel('فتح').setStyle(ButtonStyle.Secondary)
         );
@@ -337,7 +398,6 @@ client.on('interactionCreate', async interaction => {
       return;
     }
 
-    // زر استلام
     if (customId === 'ticket_claim') {
       if (!isSupport) {
         await interaction.reply({ content: `هذا الزر مخصص لـ <@&${SUPPORT_ROLE_ID}>`, ephemeral: true });
@@ -360,12 +420,11 @@ client.on('interactionCreate', async interaction => {
         await interaction.reply({ content: 'تم', ephemeral: true });
       } catch (e) {
         console.error(e);
-        await interaction.reply({ content: 'حدث خطأ أثناء استلام التكت.', ephemeral: true });
+        await interaction.reply({ content: 'حدث خطأ أثناء استلاست التكت.', ephemeral: true });
       }
       return;
     }
 
-    // زر إضافة
     if (customId === 'ticket_add') {
       if (!isSupport) {
         await interaction.reply({ content: `هذا الزر مخصص لـ <@&${SUPPORT_ROLE_ID}>`, ephemeral: true });
@@ -387,7 +446,6 @@ client.on('interactionCreate', async interaction => {
       return;
     }
 
-    // زر "اداره" (الاستدعاء القديم للسبورت)
     if (customId === 'ticket_summon_old') {
       const now = Date.now();
       const cooldownTime = 15000;
@@ -414,7 +472,7 @@ client.on('interactionCreate', async interaction => {
       return;
     }
 
-    // زر "استدعاء" الجديد (منشن صاحب التذكرة مع كولداون 15 دقيقة)
+    // زر "استدعاء" الجديد (يرسل في الخاص لصاحب التذكرة حصرياً بدون شات عام)
     if (customId === 'ticket_summon_member') {
       if (!isSupport) {
         await interaction.reply({ content: `هذا الزر مخصص لـ <@&${SUPPORT_ROLE_ID}>`, ephemeral: true });
@@ -427,27 +485,26 @@ client.on('interactionCreate', async interaction => {
 
       if (now - lastSummon < cooldownTime) {
         const remainingMinutes = Math.ceil((cooldownTime - (now - lastSummon)) / 60000);
-        await interaction.reply({ content: `يرجى الانتظار ${remainingMinutes} دقيقة قبل استخدام زر استدعاء صاحب التذكرة مرة أخرى.`, ephemeral: true });
+        await interaction.reply({ content: `يرجى الانتظار ${remainingMinutes} دقيقة قبل استخدام زر استدعاء مرة أخرى.`, ephemeral: true });
         return;
       }
 
       ticketSummonCooldowns.set(channel.id + '_member', now);
 
       try {
-        await interaction.deferReply({ ephemeral: true });
-        await interaction.deleteReply().catch(() => {});
-
         if (ownerId) {
-          const pingMsg = await channel.send({ content: `<@${ownerId}> يرجى الدخول إلى روم التذكرة والرد بسرعة!` });
-          setTimeout(async () => {
-            await pingMsg.delete().catch(() => {});
-          }, 3000);
+          const ownerUser = await client.users.fetch(ownerId).catch(() => null);
+          if (ownerUser) {
+            await ownerUser.send({ content: `تم استدعاؤك إلى روم التذكرة الخاصة بك: <#${channel.id}> يرجى الدخول والرد بسرعة!` }).catch(() => {});
+          }
         }
-      } catch (e) {}
+        await interaction.reply({ content: 'تم إرسال رسالة الاستدعاء في الخاص لصاحب التذكرة بنجاح.', ephemeral: true });
+      } catch (e) {
+        await interaction.reply({ content: 'تعذر إرسال الرسالة الخاصة لصاحب التذكرة.', ephemeral: true });
+      }
       return;
     }
 
-    // زر فتح (Open) - يظهر حصرياً لرول الإدارة المسؤول بعد الإغلاق
     if (customId === 'ticket_open') {
       if (!member.roles.cache.has(ADMIN_ROLE_ID_VALUE) && !member.permissions.has(PermissionsBitField.Flags.Administrator)) {
         await interaction.reply({ content: 'صلاحية غير مأذونة!', ephemeral: true });
